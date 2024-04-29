@@ -1,0 +1,453 @@
+---
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+# Version 2.0.0
+
+AWSTemplateFormatVersion: '2010-09-09'
+
+Description: This stack creates an automation role and an SSM Automation Run Document to enable Session Manager on an EC2 Instance.
+Parameters:
+  AutomationRoleName:
+    Description: Provide a name for the role that will be used for this automation
+    Type: String
+    Default: MGNSSMAutomationAssumeRole
+
+Resources:
+#-------------------------------------------------
+# Automation Assume role to allow running SSM Automation
+#-------------------------------------------------
+  #checkov:skip=CKV_AWS_109:false positive constraint can only be at account level, which it is.
+  #checkov:skip=CKV_AWS_111:false positive constraint can only be at account level, which it is.
+  #checkov:skip=CKV_AWS_107:false positive constraint can only be at account level, which it is.
+  AutomationAssumeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref AutomationRoleName
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service:
+            - ssm.amazonaws.com
+          Action: sts:AssumeRole
+          Condition:
+            StringEquals:
+              aws:SourceAccount: !Sub ${AWS::AccountId}
+      Policies:
+      - PolicyName: SessionManager
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - 
+            Effect: Allow
+            Action:
+              - 'ssm:DescribeDocument'
+              - 'ssm:GetDocument'
+              - 'ssm:UpdateDocument'
+              - 'ssm:CreateDocument'
+              - 'ssm:PutParameter'
+              - 'ssm:UpdateDocumentDefaultVersion'
+              - 'ssm:GetServiceSetting'
+              - 'ssm:ResetServiceSetting'
+              - 'ssm:UpdateServiceSetting'
+            Resource:
+            - '*' 
+      - PolicyName: AdditionalAssumePermission
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          -
+            Action:
+              - 'iam:GetRoles'
+              - 'iam:PassRole'
+              - 'iam:CreateServiceLinkedRole'
+              - 'iam:DeleteServiceLinkedRole'
+              - 'iam:GetServiceLinkedRoleDeletionStatus'
+              - 'ec2:DescribeInstances'
+              - 'ec2:DescribeSecurityGroups'
+              - 'ec2:describeVPCEndpoints'
+              - 'ec2:CreateVpcEndpoint'
+              - 'ec2:describeVPCs'
+              - 'ec2:ModifyInstanceMetadataOptions'
+              - 'ec2:CreateNetworkInterface'
+              - 'ec2:DescribeNetworkInterfaces'
+              - 'ec2:DeleteNetworkInterface'
+              - 'ec2:CreateTags'
+              - 'ec2:CreateSecurityGroup'
+              - 'ec2:AuthorizeSecurityGroupIngress'
+              - 'ec2:AuthorizeSecurityGroupEgress'
+              - 'ec2:AssociateIamInstanceProfile'
+              - 'sts:AssumeRole'
+            Effect: Allow
+            # all resources in account is used to ensure this can run against any new EC2 that is created via MGN or other means.
+            Resource: "*"
+
+      ManagedPolicyArns:
+      - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonSSMAutomationRole
+      - !Sub arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Path: "/"
+  #------------------------------------------------------------------------------------
+  # SSM Automation Document - creates required vpc endpoints if they do not exist
+  #------------------------------------------------------------------------------------
+  SessionManagerEnablement:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Content:
+        description: 'This automation enables session manager by creating the required VPC Endpoints'
+        schemaVersion: '0.3'
+        assumeRole: !Sub arn:${AWS::Partition}:iam::${AWS::AccountId}:role/${AutomationRoleName}
+        parameters:
+          InstanceID:
+            type: String
+            description: 'Instance ID for the instance on which session manager is to be enabled'
+            default: ''
+            allowedPattern: ^(?!(aws:))[\w.:/=+-@]{0,128}$
+
+        
+        mainSteps:
+        - name: getInstanceVPC
+          action: aws:executeAwsApi
+          onFailure: Abort
+          maxAttempts: 3
+          inputs:
+            Service: ec2
+            Api: DescribeInstances
+            InstanceIds:
+            - "{{ InstanceID }}"
+          outputs:
+          - Name: VpcId
+            Selector: $.Reservations[0].Instances[0].NetworkInterfaces[0].VpcId
+            Type: String
+          - Name: Subnet
+            Selector: $.Reservations[0].Instances[0].SubnetId
+            Type: String
+
+        - name: getVPCcidr
+          action: aws:executeAwsApi
+          onFailure: Abort
+          maxAttempts: 3
+          inputs:
+            Service: ec2
+            Api: DescribeVpcs
+            Filters:
+            - Name: vpc-id
+              Values:
+              - "{{ getInstanceVPC.VpcId }}"
+          outputs:
+          - Name: vpcCidr
+            Selector: $.Vpcs[0].CidrBlock
+            Type: String
+
+        - name: getSG
+          action: aws:executeAwsApi
+          onFailure: Continue
+          maxAttempts: 3
+          inputs:
+            Service: ec2
+            Api: DescribeSecurityGroups
+            Filters:
+            - Name: group-name
+              Values:
+              - "VPC_Endpoints_SG"
+            - Name: vpc-id
+              Values:
+              - "{{ getInstanceVPC.VpcId }}"
+          outputs:
+            - Name: sgName
+              Selector: $.SecurityGroups[0].GroupName
+              Type: String
+            - Name: sgId
+              Selector: $.SecurityGroups[0].GroupId
+              Type: String
+
+        - name: createIfnoSG
+          action: aws:branch
+          onFailure: Abort
+          isCritical: false
+          inputs:
+             Choices:
+             - NextStep: createParam
+               Variable: "{{ getSG.sgName }}"
+               StringEquals: "VPC_Endpoints_SG"
+
+        - name: createSG
+          action: aws:executeAwsApi
+          onFailure: Abort
+          maxAttempts: 3
+          inputs:
+            Service: ec2
+            Api: CreateSecurityGroup
+            Description: "Allow TCP 443 inbound from the VPC CIDR to the VPC Endpoints."
+            GroupName: "VPC_Endpoints_SG"
+            VpcId: "{{ getInstanceVPC.VpcId }}"
+          outputs:
+          - Name: groupId
+            Selector: $.GroupId
+            Type: String
+        
+        - name: CreateIngress
+          action: aws:executeAwsApi
+          onFailure: Abort
+          maxAttempts: 3
+          inputs:
+            Service: ec2
+            Api: AuthorizeSecurityGroupIngress
+            GroupId: "{{ createSG.groupId }}"
+            IpProtocol: tcp
+            FromPort: 443
+            ToPort: 443
+            CidrIp: "{{ getVPCcidr.vpcCidr }}"
+
+        - name: putParam
+          action: aws:executeAwsApi
+          onFailure: step:createParam
+          maxAttempts: 3
+          inputs:
+           Service: ssm
+           Api: PutParameter
+           Overwrite: true
+           Type: String
+           Name: SecurityGroupID
+           Value: "{{ createSG.groupId }}"
+           Description: Security Group ID for VPC Endpoints
+          nextStep: getParam
+        
+        - name: createParam
+          action: aws:executeAwsApi
+          onFailure: Continue
+          maxAttempts: 3
+          inputs:
+           Service: ssm
+           Api: PutParameter
+           Overwrite: true
+           Type: String
+           Name: SecurityGroupID
+           Value: "{{ getSG.sgId }}"
+           Description: Security Group ID for VPC Endpoints
+
+        - name: getParam
+          action: aws:executeAwsApi
+          onFailure: Abort
+          maxAttempts: 3
+          inputs:
+           Service: ssm
+           Api: GetParameter
+           Name: SecurityGroupID
+           WithDecryption: True
+          outputs:
+            - Name: sgparam
+              Selector: $.Parameter.Value
+              Type: String
+          
+        - name: turnOnIMDSV2
+          action: aws:executeAwsApi
+          onFailure: Abort
+          maxAttempts: 3
+          inputs:
+            Service: ec2
+            Api: ModifyInstanceMetadataOptions
+            HttpEndpoint: enabled
+            HttpTokens: required
+            InstanceId: "{{InstanceID}}"
+            InstanceMetadataTags: enabled
+        
+        - name: getSSMVPCEndpoint
+          action: aws:executeAwsApi
+          onFailure: Continue
+          maxAttempts: 3
+          inputs:
+            Service: ec2
+            Api: DescribeVpcEndpoints
+            Filters:
+            - Name: service-name
+              Values:
+              - !Sub com.amazonaws.${AWS::Region}.ssm
+            - Name: vpc-id
+              Values:
+              - "{{getInstanceVPC.VpcId}}"
+          outputs:
+            - Name: ssmVPCEndpoint
+              Selector: $.VpcEndpoints[0].ServiceName
+              Type: String
+        
+        - name: getSSMMessagesVPCEndpoint
+          action: aws:executeAwsApi
+          onFailure: Continue
+          maxAttempts: 3
+          inputs:
+            Service: ec2
+            Api: DescribeVpcEndpoints
+            Filters:
+            - Name: service-name
+              Values:
+              - !Sub com.amazonaws.${AWS::Region}.ssmmessages
+            - Name: vpc-id
+              Values:
+              - "{{getInstanceVPC.VpcId}}"
+          outputs:
+            - Name: ssmMessagesVPCEndpoint
+              Selector: $.VpcEndpoints[0].ServiceName
+              Type: String
+        
+        - name: getEc2VPCEndpoint
+          action: aws:executeAwsApi
+          onFailure: Continue
+          maxAttempts: 3
+          inputs:
+            Service: ec2
+            Api: DescribeVpcEndpoints
+            Filters:
+            - Name: service-name
+              Values:
+              - !Sub com.amazonaws.${AWS::Region}.ec2
+            - Name: vpc-id
+              Values:
+              - "{{ getInstanceVPC.VpcId }}"
+          outputs:
+            - Name: ec2VPCEndpoint
+              Selector: $.VpcEndpoints[0].ServiceName
+              Type: String
+        
+        - name: getEc2messagesVPCEndpoint
+          action: aws:executeAwsApi
+          onFailure: Continue
+          maxAttempts: 3
+          inputs:
+            Service: ec2
+            Api: DescribeVpcEndpoints
+            Filters:
+            - Name: service-name
+              Values:
+              - !Sub com.amazonaws.${AWS::Region}.ec2messages
+            - Name: vpc-id
+              Values:
+              - "{{getInstanceVPC.VpcId}}"
+          outputs:
+            - Name: ec2messagesVPCEndpoint
+              Selector: $.VpcEndpoints[0].ServiceName
+              Type: String
+           
+        - name: createIfnoSsmEndpoint
+          action: aws:branch
+          onFailure: Abort
+          isCritical: false
+          inputs:
+             Choices:
+             - NextStep: createIfnoSSMMessagesEndpoint
+               Variable: "{{getSSMVPCEndpoint.ssmVPCEndpoint}}"
+               StringEquals: !Sub "com.amazonaws.${AWS::Region}.ssm"
+
+        - name: createSSMEndpoint
+          action: aws:executeAwsApi
+          onFailure: Abort
+          maxAttempts: 3
+          inputs:
+            Service: ec2    
+            Api: CreateVpcEndpoint
+            VpcId: "{{getInstanceVPC.VpcId}}"
+            SecurityGroupIds:
+              - "{{ getParam.sgparam }}"
+            VpcEndpointType: Interface
+            ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssm"
+            PrivateDnsEnabled: true
+            SubnetIds:
+            - "{{ getInstanceVPC.Subnet }}"
+          outputs:
+            - Name: SSMEndpoint
+              Selector: $.vpcEndpointId
+              Type: String
+        
+        - name: createIfnoSSMMessagesEndpoint
+          action: aws:branch
+          onFailure: Abort
+          isCritical: false
+          inputs:
+            Choices:
+              - NextStep: createIfnoEc2Endpoint
+                Variable: "{{getSSMMessagesVPCEndpoint.ssmMessagesVPCEndpoint}}"
+                StringEquals: !Sub "com.amazonaws.${AWS::Region}.ssmmessages"
+                  
+        - name: createSSMMessagesEndpoint
+          action: aws:executeAwsApi
+          onFailure: Abort
+          maxAttempts: 3
+          inputs:
+            Service: ec2
+            Api: CreateVpcEndpoint
+            VpcId: "{{getInstanceVPC.VpcId}}"
+            SecurityGroupIds:
+              - "{{ getParam.sgparam }}"
+            VpcEndpointType: Interface
+            ServiceName: !Sub "com.amazonaws.${AWS::Region}.ssmmessages"
+            PrivateDnsEnabled: true
+            SubnetIds:
+            - "{{ getInstanceVPC.Subnet }}"
+          outputs:
+          - Name: SSMmessagesEndpoint
+            Selector: $.vpcEndpointId
+            Type: String
+
+        - name: createIfnoEc2Endpoint
+          action: aws:branch
+          onFailure: Continue
+          isCritical: false
+          inputs:
+            Choices:
+             - NextStep: createIfnoEc2MessagesEndpoint
+               Variable: "{{getEc2VPCEndpoint.ec2VPCEndpoint}}"
+               StringEquals: !Sub "com.amazonaws.${AWS::Region}.ec2"
+
+        - name: createEc2Endpoint
+          action: aws:executeAwsApi
+          onFailure: Abort
+          maxAttempts: 3
+          inputs:
+            Service: ec2
+            Api: CreateVpcEndpoint
+            SecurityGroupIds:
+              - "{{ getParam.sgparam }}"
+            VpcId: "{{getInstanceVPC.VpcId}}"
+            VpcEndpointType: Interface
+            ServiceName: !Sub "com.amazonaws.${AWS::Region}.ec2"
+            PrivateDnsEnabled: true
+            SubnetIds:
+            - "{{ getInstanceVPC.Subnet }}"
+          outputs:
+          - Name: ec2Endpoint
+            Selector: $.vpcEndpointId
+            Type: String
+ 
+        - name: createIfnoEc2MessagesEndpoint
+          action: aws:branch
+          onFailure: Abort
+          isCritical: false
+          inputs:
+            Choices:
+             - NextStep: createEc2MessagesEndpoint
+               Not:
+                 Variable: "{{getEc2messagesVPCEndpoint.ec2messagesVPCEndpoint}}"
+                 StringEquals: !Sub "com.amazonaws.${AWS::Region}.ec2messages"
+          isEnd: true
+
+        - name: createEc2MessagesEndpoint
+          action: aws:executeAwsApi
+          onFailure: Abort
+          maxAttempts: 3
+          inputs:
+            Service: ec2
+            Api: CreateVpcEndpoint
+            VpcId: "{{ getInstanceVPC.VpcId }}"
+            SecurityGroupIds:
+              - "{{ getParam.sgparam }}"
+            VpcEndpointType: Interface
+            ServiceName: !Sub "com.amazonaws.${AWS::Region}.ec2messages"
+            PrivateDnsEnabled: true
+            SubnetIds:
+            - "{{ getInstanceVPC.Subnet}}"
+          outputs:
+          - Name: Ec2messagesEndpoint
+            Selector: $.vpcEndpointId
+            Type: String   
+        
