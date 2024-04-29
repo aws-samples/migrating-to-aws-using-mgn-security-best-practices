@@ -1,11 +1,5 @@
-## My Project
+## Migrating to AWS Using Application Migration Service(MGN) Security Best Practices
 
-TODO: Fill this README out!
-
-Be sure to:
-
-* Change the title in this README
-* Edit your repository description on GitHub
 
 ## Security
 
